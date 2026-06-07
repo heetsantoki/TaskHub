@@ -1,0 +1,11 @@
+{
+  "name": "taskhub-root",
+  "version": "1.0.0",
+  "description": "Root package runner for TaskHub",
+  "scripts": {
+    "install:frontend": "npm --prefix frontend install",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "start:frontend": "npm --prefix frontend start"
+  }
+}
