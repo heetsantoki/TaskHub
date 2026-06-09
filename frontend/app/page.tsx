@@ -11,9 +11,11 @@ export default function Home() {
   const [isSigningIn, setIsSigningIn] = useState(false);
 
   useEffect(() => {
-    // Check if user is already logged in
+    let active = true;
+
     async function checkUser() {
       const { data: { session } } = await supabase.auth.getSession();
+      if (!active) return;
       if (session) {
         router.push('/dashboard');
       } else {
@@ -21,6 +23,21 @@ export default function Home() {
       }
     }
     checkUser();
+
+    // Listen for auth state changes to trigger redirect if session becomes active
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        if (!active) return;
+        if (session) {
+          router.push('/dashboard');
+        }
+      }
+    );
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
   }, [router]);
 
   const handleGoogleLogin = async () => {
@@ -42,14 +59,7 @@ export default function Home() {
   };
 
   if (loading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-[#0b0f19]">
-        <div className="text-center">
-          <div className="h-10 w-10 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent mx-auto"></div>
-          <p className="mt-4 text-slate-400 font-medium animate-pulse">Loading TaskHub...</p>
-        </div>
-      </div>
-    );
+    return <LoginCardSkeleton />;
   }
 
   return (
@@ -108,6 +118,41 @@ export default function Home() {
       <div className="absolute bottom-6 text-center text-xs text-slate-600">
         Built with Next.js • Flask • Supabase • Gmail API
       </div>
+    </div>
+  );
+}
+
+function LoginCardSkeleton() {
+  return (
+    <div className="relative flex min-h-screen flex-col items-center justify-center overflow-hidden bg-[#0b0f19] px-4">
+      {/* Decorative gradient backgrounds */}
+      <div className="absolute top-[-10%] left-[-10%] h-[500px] w-[500px] rounded-full bg-indigo-900/20 blur-[120px] pointer-events-none" />
+      <div className="absolute bottom-[-10%] right-[-10%] h-[500px] w-[500px] rounded-full bg-purple-900/20 blur-[120px] pointer-events-none" />
+
+      {/* Main glassmorphic card skeleton */}
+      <div className="w-full max-w-md rounded-2xl border border-slate-800/80 bg-slate-900/40 p-8 backdrop-blur-xl shadow-2xl relative z-10 animate-pulse">
+        <div className="flex flex-col items-center text-center">
+          {/* Logo Icon Placeholder */}
+          <div className="h-14 w-14 rounded-xl bg-slate-800/50 mb-6" />
+
+          {/* Heading Placeholder */}
+          <div className="h-8 w-32 bg-slate-800/50 rounded mb-3" />
+          
+          {/* Subheading Placeholder */}
+          <div className="h-4 w-48 bg-slate-800/40 rounded mb-8" />
+
+          {/* Paragraph Lines Placeholders */}
+          <div className="h-3 w-full bg-slate-800/30 rounded mb-2.5" />
+          <div className="h-3 w-5/6 bg-slate-800/30 rounded mb-2.5" />
+          <div className="h-3 w-4/5 bg-slate-800/30 rounded mb-10" />
+
+          {/* Google Login Button Placeholder */}
+          <div className="h-12 w-full bg-slate-800/40 rounded-xl" />
+        </div>
+      </div>
+
+      {/* Footer notice placeholder */}
+      <div className="absolute bottom-6 h-4 w-64 bg-slate-900/40 rounded animate-pulse" />
     </div>
   );
 }

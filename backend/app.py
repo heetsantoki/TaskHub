@@ -1,5 +1,6 @@
 import os
 import jwt
+from jwt import PyJWKClient
 import smtplib
 import datetime
 from email.mime.text import MIMEText
@@ -28,6 +29,10 @@ if not supabase_url or not supabase_key:
     print("WARNING: Supabase URL or Key is missing from environment variables.")
 
 supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+
+# Initialize JWK Client for ES256 signature verification (Supabase asymmetric key)
+jwks_url = f"{supabase_url}/auth/v1/.well-known/jwks.json" if supabase_url else None
+jwk_client = PyJWKClient(jwks_url) if jwks_url else None
 
 def send_email_async(to_email, subject, html_body):
     """Send emails in a background thread to prevent blocking client requests."""
@@ -61,35 +66,58 @@ def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization", None)
+        print(f"Authorization header received: {auth_header[:30] if auth_header else 'None'}", flush=True)
         if not auth_header:
             return jsonify({"error": "Authorization header is missing"}), 401
         
         parts = auth_header.split()
         if parts[0].lower() != "bearer" or len(parts) < 2:
+            print(f"Authorization header format invalid: {parts}", flush=True)
             return jsonify({"error": "Authorization header must be Bearer token"}), 401
         
         token = parts[1]
         
-        if not supabase_jwt_secret:
-            return jsonify({"error": "Server configuration error: JWT secret is missing"}), 500
-        
         try:
-            # Decode the Supabase JWT using the project's JWT Secret
-            payload = jwt.decode(
-                token,
-                supabase_jwt_secret,
-                algorithms=["HS256"],
-                audience="authenticated"
-            )
+            # Inspect token header to determine algorithm
+            unverified_header = jwt.get_unverified_header(token)
+            alg = unverified_header.get("alg", "HS256")
+            
+            if alg == "ES256":
+                if not jwk_client:
+                    return jsonify({"error": "JWK client not initialized (check SUPABASE_URL)"}), 500
+                signing_key = jwk_client.get_signing_key_from_jwt(token)
+                payload = jwt.decode(
+                    token,
+                    signing_key.key,
+                    algorithms=["ES256"],
+                    audience="authenticated"
+                )
+            else:
+                if not supabase_jwt_secret:
+                    return jsonify({"error": "Server configuration error: JWT secret is missing"}), 500
+                payload = jwt.decode(
+                    token,
+                    supabase_jwt_secret,
+                    algorithms=["HS256"],
+                    audience="authenticated"
+                )
+                
             request.user = {
                 "id": payload.get("sub"),
                 "email": payload.get("email"),
                 "full_name": payload.get("user_metadata", {}).get("full_name") or payload.get("email")
             }
-        except jwt.ExpiredSignatureError:
+        except jwt.ExpiredSignatureError as e:
+            print(f"JWT Verification Failed (Expired): {str(e)}", flush=True)
             return jsonify({"error": "Token has expired"}), 401
         except jwt.InvalidTokenError as e:
+            print(f"JWT Verification Failed (Invalid): {str(e)}. Secret starts with: {supabase_jwt_secret[:10] if supabase_jwt_secret else 'None'}. Token starts with: {token[:20] if token else 'None'}", flush=True)
             return jsonify({"error": f"Invalid token: {str(e)}"}), 401
+        except Exception as e:
+            print(f"JWT Verification Failed (Generic Exception): {str(e)}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return jsonify({"error": f"Internal auth error: {str(e)}"}), 500
         
         return f(*args, **kwargs)
     return decorated
@@ -175,6 +203,9 @@ def create_task():
                 
         return jsonify(new_task), 201
     except Exception as e:
+        print(f"Error in create_task: {str(e)}", flush=True)
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/tasks/<task_id>", methods=["PUT"])
@@ -194,9 +225,18 @@ def update_task(task_id):
             
         task = task_res.data[0]
         
+        # If the task is already completed, it is locked.
+        if task["status"] == "completed":
+            return jsonify({"error": "Completed tasks are locked and cannot be modified"}), 400
+            
         # Check permissions: must be creator or assignee
         if task["created_by"] != request.user["id"] and task["assigned_to"] != request.user["id"]:
             return jsonify({"error": "Unauthorized to update this task"}), 403
+            
+        # If updating metadata (title, description, assigned_to), only the creator is allowed
+        is_metadata_update = any(field in data for field in ["title", "description", "assigned_to"])
+        if is_metadata_update and task["created_by"] != request.user["id"]:
+            return jsonify({"error": "Only the task creator can edit task details"}), 403
             
         update_data = {}
         if "title" in data:
@@ -251,14 +291,17 @@ def update_task(task_id):
 def delete_task(task_id):
     """Delete a task. Only the creator of the task is authorized."""
     try:
-        # Check task existence and ownership
-        task_res = supabase.table("tasks").select("created_by").eq("id", task_id).execute()
+        # Check task existence, ownership, and status
+        task_res = supabase.table("tasks").select("created_by, status").eq("id", task_id).execute()
         if not task_res.data:
             return jsonify({"error": "Task not found"}), 404
             
         task = task_res.data[0]
         if task["created_by"] != request.user["id"]:
             return jsonify({"error": "Only the task creator can delete it"}), 403
+            
+        if task["status"] == "completed":
+            return jsonify({"error": "Completed tasks are locked and cannot be deleted"}), 400
             
         supabase.table("tasks").delete().eq("id", task_id).execute()
         return jsonify({"success": True}), 200

@@ -15,7 +15,10 @@ import {
   CheckCircle2,
   Users,
   AlertCircle,
-  Inbox
+  Inbox,
+  Search,
+  X,
+  Pencil
 } from 'lucide-react';
 
 interface UserProfile {
@@ -53,36 +56,100 @@ export default function Dashboard() {
   const [newDescription, setNewDescription] = useState('');
   const [newAssignedTo, setNewAssignedTo] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [assignSearchQuery, setAssignSearchQuery] = useState('');
+  const [isSuggestionsOpen, setIsSuggestionsOpen] = useState(false);
+  const [selectedViewTask, setSelectedViewTask] = useState<Task | null>(null);
+
+  // Edit form state
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [editAssignedTo, setEditAssignedTo] = useState('');
+  const [editAssignSearchQuery, setEditAssignSearchQuery] = useState('');
+  const [isEditSuggestionsOpen, setIsEditSuggestionsOpen] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
+
+  const filteredUsers = users.filter(u =>
+    u.email.toLowerCase().includes(assignSearchQuery.toLowerCase()) ||
+    u.full_name.toLowerCase().includes(assignSearchQuery.toLowerCase())
+  );
+
+  const selectedAssignee = users.find(u => u.id === newAssignedTo) || null;
+
+  const filteredEditUsers = users.filter(u =>
+    u.email.toLowerCase().includes(editAssignSearchQuery.toLowerCase()) ||
+    u.full_name.toLowerCase().includes(editAssignSearchQuery.toLowerCase())
+  );
+
+  const selectedEditAssignee = users.find(u => u.id === editAssignedTo) || null;
 
   const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
 
   useEffect(() => {
+    let active = true;
+    let dataLoaded = false;
+
+    // Check if we are currently in an OAuth callback (hash contains access_token or error info)
+    const isCallback = typeof window !== 'undefined' && 
+      (window.location.hash.includes('access_token=') || 
+       window.location.hash.includes('error=') || 
+       window.location.hash.includes('error_description='));
+
     async function init() {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) {
+      const { data: { session: initialSession } } = await supabase.auth.getSession();
+      if (!active) return;
+
+      if (initialSession) {
+        setSession(initialSession);
+        setCurrentUser(initialSession.user);
+        if (!dataLoaded) {
+          dataLoaded = true;
+          await loadData(initialSession.access_token);
+        }
+      } else if (!isCallback) {
+        // Only redirect to login page if we are NOT in the middle of a callback
         router.push('/');
-        return;
       }
-      setSession(session);
-      setCurrentUser(session.user);
-      await loadData(session.access_token);
     }
+    
     init();
 
-    // Listen for auth state changes
+    // Listen for auth state changes (e.g. when callback parses or user logs out)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, currentSession) => {
+        if (!active) return;
+
         if (event === 'SIGNED_OUT') {
           router.push('/');
         } else if (currentSession) {
           setSession(currentSession);
           setCurrentUser(currentSession.user);
+          if (!dataLoaded) {
+            dataLoaded = true;
+            await loadData(currentSession.access_token);
+          }
         }
       }
     );
 
+    // Safety timeout: If in callback but no session is established after 5 seconds, redirect to login
+    let timeoutId: any;
+    if (isCallback) {
+      timeoutId = setTimeout(async () => {
+        if (!active) return;
+        const { data: { session: currentSession } } = await supabase.auth.getSession();
+        if (!currentSession) {
+          console.warn('OAuth callback timeout: No session established.');
+          router.push('/');
+        }
+      }, 5000);
+    }
+
     return () => {
+      active = false;
       subscription.unsubscribe();
+      if (timeoutId) clearTimeout(timeoutId);
     };
   }, [router]);
 
@@ -102,6 +169,9 @@ export default function Dashboard() {
       ]);
 
       if (!tasksRes.ok || !usersRes.ok) {
+        const tasksErr = !tasksRes.ok ? await tasksRes.text() : '';
+        const usersErr = !usersRes.ok ? await usersRes.text() : '';
+        console.error('Fetch failed:', { tasksStatus: tasksRes.status, tasksErr, usersStatus: usersRes.status, usersErr });
         throw new Error('Failed to load data from backend server.');
       }
 
@@ -121,6 +191,15 @@ export default function Dashboard() {
   const handleSignOut = async () => {
     await supabase.auth.signOut();
     router.push('/');
+  };
+
+  const handleCloseModal = () => {
+    setNewTitle('');
+    setNewDescription('');
+    setNewAssignedTo('');
+    setAssignSearchQuery('');
+    setIsSuggestionsOpen(false);
+    setIsModalOpen(false);
   };
 
   const handleCreateTask = async (e: React.FormEvent) => {
@@ -151,11 +230,8 @@ export default function Dashboard() {
       // Reload data to reflect task creation and updated assignments
       await loadData(session.access_token);
       
-      // Reset form
-      setNewTitle('');
-      setNewDescription('');
-      setNewAssignedTo('');
-      setIsModalOpen(false);
+      // Reset form and close modal
+      handleCloseModal();
     } catch (err: any) {
       setError(err.message || 'Error creating task');
     } finally {
@@ -209,20 +285,66 @@ export default function Dashboard() {
     }
   };
 
+  const handleOpenEditModal = (task: Task) => {
+    setEditingTask(task);
+    setEditTitle(task.title);
+    setEditDescription(task.description || '');
+    setEditAssignedTo(task.assigned_to || '');
+    setEditAssignSearchQuery('');
+    setIsEditModalOpen(true);
+  };
+
+  const handleCloseEditModal = () => {
+    setEditingTask(null);
+    setEditTitle('');
+    setEditDescription('');
+    setEditAssignedTo('');
+    setEditAssignSearchQuery('');
+    setIsEditSuggestionsOpen(false);
+    setIsEditModalOpen(false);
+  };
+
+  const handleUpdateTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTask || !editTitle.trim()) return;
+
+    try {
+      setIsUpdating(true);
+      setError(null);
+
+      const res = await fetch(`${API_URL}/api/tasks/${editingTask.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`
+        },
+        body: JSON.stringify({
+          title: editTitle,
+          description: editDescription,
+          assigned_to: editAssignedTo || null
+        })
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(errText || 'Failed to update task');
+      }
+
+      // Reload data to reflect changes
+      await loadData(session.access_token);
+      
+      // Close edit modal
+      handleCloseEditModal();
+    } catch (err: any) {
+      setError(err.message || 'Error updating task');
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
   const pendingTasks = tasks.filter(t => t.status === 'pending');
   const inProgressTasks = tasks.filter(t => t.status === 'in_progress');
   const completedTasks = tasks.filter(t => t.status === 'completed');
-
-  if (loading && tasks.length === 0) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-[#0b0f19]">
-        <div className="text-center">
-          <div className="h-10 w-10 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent mx-auto"></div>
-          <p className="mt-4 text-slate-400 font-medium">Fetching dashboard tasks...</p>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="flex flex-col min-h-screen bg-[#0b0f19] text-slate-100">
@@ -241,24 +363,28 @@ export default function Dashboard() {
 
           {/* User Profile and Logout */}
           <div className="flex items-center gap-4">
-            <div className="flex items-center gap-3 bg-slate-900/50 py-1.5 pl-2.5 pr-4 rounded-full border border-slate-800/80">
-              {currentUser?.user_metadata?.avatar_url ? (
-                <img
-                  src={currentUser.user_metadata.avatar_url}
-                  alt={currentUser.user_metadata.full_name || 'Avatar'}
-                  className="w-7 h-7 rounded-full border border-slate-700 object-cover"
-                />
-              ) : (
-                <div className="w-7 h-7 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-semibold">
-                  <User className="h-3.5 w-3.5" />
+            {currentUser ? (
+              <div className="flex items-center gap-3 bg-slate-900/50 py-1.5 pl-2.5 pr-4 rounded-full border border-slate-800/80">
+                {currentUser?.user_metadata?.avatar_url ? (
+                  <img
+                    src={currentUser.user_metadata.avatar_url}
+                    alt={currentUser.user_metadata.full_name || 'Avatar'}
+                    className="w-7 h-7 rounded-full border border-slate-700 object-cover"
+                  />
+                ) : (
+                  <div className="w-7 h-7 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-semibold">
+                    <User className="h-3.5 w-3.5" />
+                  </div>
+                )}
+                <div className="text-left">
+                  <p className="text-xs font-semibold text-slate-200">
+                    {currentUser?.user_metadata?.full_name || currentUser?.email}
+                  </p>
                 </div>
-              )}
-              <div className="text-left">
-                <p className="text-xs font-semibold text-slate-200">
-                  {currentUser?.user_metadata?.full_name || currentUser?.email}
-                </p>
               </div>
-            </div>
+            ) : (
+              <HeaderProfileSkeleton />
+            )}
 
             <button
               onClick={handleSignOut}
@@ -314,17 +440,29 @@ export default function Dashboard() {
             </div>
 
             <div className="flex-grow space-y-4">
-              {pendingTasks.map(task => (
-                <TaskCard
-                  key={task.id}
-                  task={task}
-                  currentUser={currentUser}
-                  onStatusChange={handleUpdateStatus}
-                  onDelete={handleDeleteTask}
-                />
-              ))}
+              {loading ? (
+                <>
+                  <TaskCardSkeleton />
+                  <TaskCardSkeleton />
+                  <TaskCardSkeleton />
+                </>
+              ) : (
+                <>
+                  {pendingTasks.map(task => (
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      currentUser={currentUser}
+                      onStatusChange={handleUpdateStatus}
+                      onDelete={handleDeleteTask}
+                      onEdit={handleOpenEditModal}
+                      onViewDetails={setSelectedViewTask}
+                    />
+                  ))}
 
-              {pendingTasks.length === 0 && <EmptyColumnState message="No pending tasks" />}
+                  {pendingTasks.length === 0 && <EmptyColumnState message="No pending tasks" />}
+                </>
+              )}
             </div>
           </div>
 
@@ -341,17 +479,29 @@ export default function Dashboard() {
             </div>
 
             <div className="flex-grow space-y-4">
-              {inProgressTasks.map(task => (
-                <TaskCard
-                  key={task.id}
-                  task={task}
-                  currentUser={currentUser}
-                  onStatusChange={handleUpdateStatus}
-                  onDelete={handleDeleteTask}
-                />
-              ))}
+              {loading ? (
+                <>
+                  <TaskCardSkeleton />
+                  <TaskCardSkeleton />
+                  <TaskCardSkeleton />
+                </>
+              ) : (
+                <>
+                  {inProgressTasks.map(task => (
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      currentUser={currentUser}
+                      onStatusChange={handleUpdateStatus}
+                      onDelete={handleDeleteTask}
+                      onEdit={handleOpenEditModal}
+                      onViewDetails={setSelectedViewTask}
+                    />
+                  ))}
 
-              {inProgressTasks.length === 0 && <EmptyColumnState message="No tasks in progress" />}
+                  {inProgressTasks.length === 0 && <EmptyColumnState message="No tasks in progress" />}
+                </>
+              )}
             </div>
           </div>
 
@@ -368,17 +518,29 @@ export default function Dashboard() {
             </div>
 
             <div className="flex-grow space-y-4">
-              {completedTasks.map(task => (
-                <TaskCard
-                  key={task.id}
-                  task={task}
-                  currentUser={currentUser}
-                  onStatusChange={handleUpdateStatus}
-                  onDelete={handleDeleteTask}
-                />
-              ))}
+              {loading ? (
+                <>
+                  <TaskCardSkeleton />
+                  <TaskCardSkeleton />
+                  <TaskCardSkeleton />
+                </>
+              ) : (
+                <>
+                  {completedTasks.map(task => (
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      currentUser={currentUser}
+                      onStatusChange={handleUpdateStatus}
+                      onDelete={handleDeleteTask}
+                      onEdit={handleOpenEditModal}
+                      onViewDetails={setSelectedViewTask}
+                    />
+                  ))}
 
-              {completedTasks.length === 0 && <EmptyColumnState message="No completed tasks" />}
+                  {completedTasks.length === 0 && <EmptyColumnState message="No completed tasks" />}
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -422,19 +584,103 @@ export default function Dashboard() {
                 <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
                   Assign To
                 </label>
-                <select
-                  value={newAssignedTo}
-                  onChange={e => setNewAssignedTo(e.target.value)}
-                  className="w-full rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                >
-                  <option value="">Unassigned (Self-assigned)</option>
-                  {users.map(u => (
-                    <option key={u.id} value={u.id}>
-                      {u.full_name} ({u.email}) {u.id === currentUser?.id ? '(You)' : ''}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[10px] text-indigo-400/80 mt-1 flex items-center gap-1">
+                <div className="relative">
+                  {selectedAssignee ? (
+                    <div className="flex items-center justify-between rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-2.5 text-sm text-indigo-300">
+                      <div className="flex items-center gap-2.5">
+                        {selectedAssignee.avatar_url ? (
+                          <img
+                            src={selectedAssignee.avatar_url}
+                            alt={selectedAssignee.full_name}
+                            className="w-6 h-6 rounded-full object-cover border border-indigo-500/20"
+                          />
+                        ) : (
+                          <div className="w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold border border-indigo-500/20">
+                            <User className="h-3.5 w-3.5" />
+                          </div>
+                        )}
+                        <div>
+                          <span className="font-semibold text-slate-200">{selectedAssignee.full_name}</span>
+                          <span className="text-xs text-slate-400 ml-2">({selectedAssignee.email})</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNewAssignedTo('');
+                          setAssignSearchQuery('');
+                        }}
+                        className="text-slate-400 hover:text-red-400 transition-colors p-1 rounded-lg hover:bg-red-500/10 cursor-pointer"
+                        title="Remove assignment"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="relative">
+                        <input
+                          type="text"
+                          placeholder="Search team members by email or name..."
+                          value={assignSearchQuery}
+                          onChange={(e) => {
+                            setAssignSearchQuery(e.target.value);
+                            setIsSuggestionsOpen(true);
+                          }}
+                          onFocus={() => setIsSuggestionsOpen(true)}
+                          onBlur={() => setTimeout(() => setIsSuggestionsOpen(false), 200)}
+                          className="w-full rounded-xl border border-slate-800 bg-slate-900/50 pl-10 pr-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                        />
+                        <Search className="absolute left-3.5 top-3.5 h-4 w-4 text-slate-500" />
+                      </div>
+
+                      {isSuggestionsOpen && (
+                        <div className="absolute z-50 mt-1.5 w-full rounded-xl border border-slate-800 bg-[#0d1321]/95 backdrop-blur-md shadow-2xl overflow-hidden max-h-48 overflow-y-auto">
+                          {filteredUsers.length > 0 ? (
+                            <ul className="divide-y divide-slate-800/40">
+                              {filteredUsers.map((u) => (
+                                <li key={u.id}>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setNewAssignedTo(u.id);
+                                      setAssignSearchQuery('');
+                                      setIsSuggestionsOpen(false);
+                                    }}
+                                    className="w-full flex items-center gap-3 px-4 py-2.5 text-left text-sm hover:bg-indigo-500/10 hover:text-indigo-300 transition-all text-slate-300 cursor-pointer"
+                                  >
+                                    {u.avatar_url ? (
+                                      <img
+                                        src={u.avatar_url}
+                                        alt={u.full_name}
+                                        className="w-7 h-7 rounded-full object-cover border border-slate-700"
+                                      />
+                                    ) : (
+                                      <div className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs font-semibold border border-slate-700">
+                                        {u.full_name.charAt(0).toUpperCase()}
+                                      </div>
+                                    )}
+                                    <div>
+                                      <p className="font-semibold text-slate-200 text-xs">
+                                        {u.full_name} {u.id === currentUser?.id ? '(You)' : ''}
+                                      </p>
+                                      <p className="text-[10px] text-slate-400">{u.email}</p>
+                                    </div>
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <div className="px-4 py-3 text-xs text-slate-500 italic text-center">
+                              No matching team members found
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+                <p className="text-[10px] text-indigo-400/80 mt-1.5 flex items-center gap-1">
                   <Users className="h-3 w-3" /> Assigning sends an automatic email notification via Gmail.
                 </p>
               </div>
@@ -442,7 +688,7 @@ export default function Dashboard() {
               <div className="flex justify-end gap-3 pt-4 border-t border-slate-800/80 mt-6">
                 <button
                   type="button"
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={handleCloseModal}
                   className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-400 hover:text-white transition-colors cursor-pointer"
                 >
                   Cancel
@@ -459,6 +705,317 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* Task Editing Modal */}
+      {isEditModalOpen && editingTask && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg rounded-2xl border border-slate-800 bg-[#0d1321] p-6 shadow-2xl relative">
+            <h3 className="text-xl font-bold text-white mb-4">Edit Task</h3>
+
+            <form onSubmit={handleUpdateTask} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Task Title *
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="What needs to be done?"
+                  value={editTitle}
+                  onChange={e => setEditTitle(e.target.value)}
+                  className="w-full rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Description
+                </label>
+                <textarea
+                  placeholder="Provide details about the task..."
+                  value={editDescription}
+                  onChange={e => setEditDescription(e.target.value)}
+                  rows={4}
+                  className="w-full rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Assign To
+                </label>
+                <div className="relative">
+                  {selectedEditAssignee ? (
+                    <div className="flex items-center justify-between rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-2.5 text-sm text-indigo-300">
+                      <div className="flex items-center gap-2.5">
+                        {selectedEditAssignee.avatar_url ? (
+                          <img
+                            src={selectedEditAssignee.avatar_url}
+                            alt={selectedEditAssignee.full_name}
+                            className="w-6 h-6 rounded-full object-cover border border-indigo-500/20"
+                          />
+                        ) : (
+                          <div className="w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-xs font-bold border border-indigo-500/20">
+                            <User className="h-3.5 w-3.5" />
+                          </div>
+                        )}
+                        <div>
+                          <span className="font-semibold text-slate-200">{selectedEditAssignee.full_name}</span>
+                          <span className="text-xs text-slate-400 ml-2">({selectedEditAssignee.email})</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditAssignedTo('');
+                          setEditAssignSearchQuery('');
+                        }}
+                        className="text-slate-400 hover:text-red-400 transition-colors p-1 rounded-lg hover:bg-red-500/10 cursor-pointer"
+                        title="Remove assignment"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="relative">
+                        <input
+                          type="text"
+                          placeholder="Search team members by email or name..."
+                          value={editAssignSearchQuery}
+                          onChange={(e) => {
+                            setEditAssignSearchQuery(e.target.value);
+                            setIsEditSuggestionsOpen(true);
+                          }}
+                          onFocus={() => setIsEditSuggestionsOpen(true)}
+                          onBlur={() => setTimeout(() => setIsEditSuggestionsOpen(false), 200)}
+                          className="w-full rounded-xl border border-slate-800 bg-slate-900/50 pl-10 pr-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                        />
+                        <Search className="absolute left-3.5 top-3.5 h-4 w-4 text-slate-500" />
+                      </div>
+
+                      {isEditSuggestionsOpen && (
+                        <div className="absolute z-50 mt-1.5 w-full rounded-xl border border-slate-800 bg-[#0d1321]/95 backdrop-blur-md shadow-2xl overflow-hidden max-h-48 overflow-y-auto">
+                          {filteredEditUsers.length > 0 ? (
+                            <ul className="divide-y divide-slate-800/40">
+                              {filteredEditUsers.map((u) => (
+                                <li key={u.id}>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditAssignedTo(u.id);
+                                      setEditAssignSearchQuery('');
+                                      setIsEditSuggestionsOpen(false);
+                                    }}
+                                    className="w-full flex items-center gap-3 px-4 py-2.5 text-left text-sm hover:bg-indigo-500/10 hover:text-indigo-300 transition-all text-slate-300 cursor-pointer"
+                                  >
+                                    {u.avatar_url ? (
+                                      <img
+                                        src={u.avatar_url}
+                                        alt={u.full_name}
+                                        className="w-7 h-7 rounded-full object-cover border border-slate-700"
+                                      />
+                                    ) : (
+                                      <div className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs font-semibold border border-slate-700">
+                                        {u.full_name.charAt(0).toUpperCase()}
+                                      </div>
+                                    )}
+                                    <div>
+                                      <p className="font-semibold text-slate-200 text-xs">
+                                        {u.full_name} {u.id === currentUser?.id ? '(You)' : ''}
+                                      </p>
+                                      <p className="text-[10px] text-slate-400">{u.email}</p>
+                                    </div>
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <div className="px-4 py-3 text-xs text-slate-500 italic text-center">
+                              No matching team members found
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+                <p className="text-[10px] text-indigo-400/80 mt-1.5 flex items-center gap-1">
+                  <Users className="h-3 w-3" /> Assigning sends an automatic email notification via Gmail.
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-3 pt-4 border-t border-slate-800/80 mt-6">
+                <button
+                  type="button"
+                  onClick={handleCloseEditModal}
+                  className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUpdating}
+                  className="rounded-xl bg-gradient-to-r from-indigo-500 to-violet-600 px-5 py-2 text-sm font-semibold text-white shadow-md hover:from-indigo-600 hover:to-violet-700 active:scale-[0.98] transition-all disabled:opacity-75 cursor-pointer"
+                >
+                  {isUpdating ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Task Detail Modal */}
+      {selectedViewTask && (
+        <div 
+          onClick={() => setSelectedViewTask(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg rounded-2xl border border-slate-800 bg-[#0d1321] p-6 shadow-2xl relative"
+          >
+            {/* Header / Title */}
+            <div className="flex justify-between items-start gap-4 mb-4">
+              <div>
+                <h3 className="text-xl font-bold text-white break-words">{selectedViewTask.title}</h3>
+                <div className="flex items-center gap-2 mt-1.5">
+                  {/* Status Badge */}
+                  {selectedViewTask.status === 'pending' && (
+                    <span className="text-[10px] font-bold py-0.5 px-2 rounded-md bg-amber-500/15 text-amber-400 border border-amber-500/20">
+                      Pending
+                    </span>
+                  )}
+                  {selectedViewTask.status === 'in_progress' && (
+                    <span className="text-[10px] font-bold py-0.5 px-2 rounded-md bg-indigo-500/15 text-indigo-400 border border-indigo-500/20 animate-pulse">
+                      In Progress
+                    </span>
+                  )}
+                  {selectedViewTask.status === 'completed' && (
+                    <span className="text-[10px] font-bold py-0.5 px-2 rounded-md bg-emerald-500/15 text-emerald-400 border border-emerald-500/20">
+                      Completed
+                    </span>
+                  )}
+                </div>
+              </div>
+              
+              <button
+                onClick={() => setSelectedViewTask(null)}
+                className="text-slate-400 hover:text-white transition-colors p-1.5 rounded-lg hover:bg-slate-800/60 cursor-pointer"
+                title="Close Modal"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Description */}
+            <div className="mb-6 bg-slate-950/20 border border-slate-800/40 rounded-xl p-4 min-h-[100px] max-h-[200px] overflow-y-auto">
+              <p className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Description</p>
+              <p className="text-sm text-slate-300 leading-relaxed break-words whitespace-pre-wrap">
+                {selectedViewTask.description || 'No description provided.'}
+              </p>
+            </div>
+
+            {/* Profiles (Creator & Assignee) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6 pt-4 border-t border-slate-800/40">
+              {/* Creator details */}
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2">Created By</p>
+                <div className="flex items-center gap-2.5">
+                  {selectedViewTask.created_by_profile?.avatar_url ? (
+                    <img
+                      src={selectedViewTask.created_by_profile.avatar_url}
+                      alt={selectedViewTask.created_by_profile.full_name}
+                      className="w-8 h-8 rounded-full object-cover border border-slate-800"
+                    />
+                  ) : (
+                    <div className="w-8 h-8 rounded-full bg-indigo-500/10 text-indigo-400 flex items-center justify-center text-xs font-bold border border-indigo-500/20">
+                      <User className="h-4 w-4" />
+                    </div>
+                  )}
+                  <div className="overflow-hidden">
+                    <p className="text-xs font-semibold text-slate-200 truncate">
+                      {selectedViewTask.created_by_profile?.full_name || 'Unknown User'}
+                    </p>
+                    <p className="text-[10px] text-slate-400 truncate">
+                      {selectedViewTask.created_by_profile?.email || 'N/A'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Assignee details */}
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2">Assigned To</p>
+                {selectedViewTask.assigned_to_profile ? (
+                  <div className="flex items-center gap-2.5">
+                    {selectedViewTask.assigned_to_profile.avatar_url ? (
+                      <img
+                        src={selectedViewTask.assigned_to_profile.avatar_url}
+                        alt={selectedViewTask.assigned_to_profile.full_name}
+                        className="w-8 h-8 rounded-full object-cover border border-slate-800"
+                      />
+                    ) : (
+                      <div className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs font-bold border border-slate-700">
+                        <User className="h-4 w-4" />
+                      </div>
+                    )}
+                    <div className="overflow-hidden">
+                      <p className="text-xs font-semibold text-slate-200 truncate">
+                        {selectedViewTask.assigned_to_profile.full_name}
+                      </p>
+                      <p className="text-[10px] text-slate-400 truncate">
+                        {selectedViewTask.assigned_to_profile.email}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center h-8">
+                    <p className="text-xs text-slate-500 italic">Unassigned</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Dates & Timeline */}
+            <div className="pt-4 border-t border-slate-800/40 text-[10px] text-slate-500 space-y-1">
+              <p>
+                <strong>Created at:</strong> {new Date(selectedViewTask.created_at).toLocaleString()}
+              </p>
+              {selectedViewTask.completed_at && (
+                <p className="text-emerald-500/80">
+                  <strong>Completed at:</strong> {new Date(selectedViewTask.completed_at).toLocaleString()}
+                </p>
+              )}
+            </div>
+
+            {/* Bottom Actions / Close */}
+            <div className="flex justify-end gap-3 pt-4 border-t border-slate-800/40 mt-6">
+              {selectedViewTask.created_by === currentUser?.id && selectedViewTask.status !== 'completed' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const taskToEdit = selectedViewTask;
+                    setSelectedViewTask(null);
+                    handleOpenEditModal(taskToEdit);
+                  }}
+                  className="rounded-xl border border-slate-800 bg-slate-900/50 hover:bg-indigo-500/10 hover:border-indigo-500/30 text-indigo-400 transition-all px-5 py-2 text-sm font-semibold cursor-pointer flex items-center gap-2"
+                >
+                  <Pencil className="h-4 w-4" /> Edit Task
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setSelectedViewTask(null)}
+                className="rounded-xl bg-slate-800 hover:bg-slate-700 px-5 py-2 text-sm font-semibold text-slate-200 shadow-md active:scale-[0.98] transition-all cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -468,31 +1025,53 @@ function TaskCard({
   task,
   currentUser,
   onStatusChange,
-  onDelete
+  onDelete,
+  onEdit,
+  onViewDetails
 }: {
   task: Task;
   currentUser: any;
   onStatusChange: (id: string, status: 'pending' | 'in_progress' | 'completed') => void;
   onDelete: (id: string) => void;
+  onEdit: (task: Task) => void;
+  onViewDetails: (task: Task) => void;
 }) {
   const isCreator = task.created_by === currentUser?.id;
   const isAssignee = task.assigned_to === currentUser?.id;
 
   return (
-    <div className="group relative rounded-xl border border-slate-800/80 bg-[#0d1321]/50 p-4 hover:border-slate-700/80 hover:bg-[#0d1321] transition-all shadow-md">
+    <div 
+      onClick={() => onViewDetails(task)}
+      className="group relative rounded-xl border border-slate-800/80 bg-[#0d1321]/50 p-4 hover:border-slate-700/80 hover:bg-[#0d1321] transition-all shadow-md cursor-pointer hover:scale-[1.01] duration-200"
+    >
       {/* Title */}
       <div className="flex justify-between items-start mb-1.5">
-        <h4 className="font-bold text-slate-100 text-sm group-hover:text-white transition-colors break-words max-w-[80%]">
+        <h4 className="font-bold text-slate-100 text-sm group-hover:text-white transition-colors break-words max-w-[75%]">
           {task.title}
         </h4>
-        {isCreator && (
-          <button
-            onClick={() => onDelete(task.id)}
-            className="text-slate-500 hover:text-red-400 transition-colors p-0.5 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 hover:bg-red-500/10 cursor-pointer"
-            title="Delete Task"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
+        {isCreator && task.status !== 'completed' && (
+          <div className="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit(task);
+              }}
+              className="text-slate-500 hover:text-indigo-400 transition-colors p-0.5 rounded hover:bg-indigo-500/10 cursor-pointer"
+              title="Edit Task"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(task.id);
+              }}
+              className="text-slate-500 hover:text-red-400 transition-colors p-0.5 rounded hover:bg-red-500/10 cursor-pointer"
+              title="Delete Task"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
         )}
       </div>
 
@@ -532,7 +1111,10 @@ function TaskCard({
       <div className="flex justify-end gap-1.5 border-t border-slate-800/60 pt-3 mt-1">
         {task.status === 'pending' && (
           <button
-            onClick={() => onStatusChange(task.id, 'in_progress')}
+            onClick={(e) => {
+              e.stopPropagation();
+              onStatusChange(task.id, 'in_progress');
+            }}
             className="flex items-center gap-1 text-[10px] font-bold py-1 px-2.5 rounded-lg border border-slate-800 text-indigo-400 bg-indigo-500/5 hover:bg-indigo-500/10 hover:border-indigo-500/30 transition-all cursor-pointer"
           >
             <Play className="h-3 w-3" /> Start Progress
@@ -541,7 +1123,10 @@ function TaskCard({
 
         {task.status === 'in_progress' && (
           <button
-            onClick={() => onStatusChange(task.id, 'completed')}
+            onClick={(e) => {
+              e.stopPropagation();
+              onStatusChange(task.id, 'completed');
+            }}
             className="flex items-center gap-1 text-[10px] font-bold py-1 px-2.5 rounded-lg border border-slate-800 text-emerald-400 bg-emerald-500/5 hover:bg-emerald-500/10 hover:border-emerald-500/30 transition-all cursor-pointer"
           >
             <Check className="h-3 w-3" /> Complete Task
@@ -563,6 +1148,41 @@ function EmptyColumnState({ message }: { message: string }) {
     <div className="flex flex-col items-center justify-center p-8 rounded-xl border border-dashed border-slate-800/50 bg-slate-900/10 text-center h-[200px]">
       <Inbox className="h-8 w-8 text-slate-600 mb-2 stroke-[1.5]" />
       <p className="text-xs font-semibold text-slate-500">{message}</p>
+    </div>
+  );
+}
+
+function HeaderProfileSkeleton() {
+  return (
+    <div className="flex items-center gap-3 bg-slate-900/50 py-1.5 pl-2.5 pr-4 rounded-full border border-slate-800/80 animate-pulse">
+      <div className="w-7 h-7 rounded-full bg-slate-800/50" />
+      <div className="w-20 h-3 bg-slate-800/40 rounded" />
+    </div>
+  );
+}
+
+function TaskCardSkeleton() {
+  return (
+    <div className="rounded-xl border border-slate-800/50 bg-[#0d1321]/30 p-4 animate-pulse">
+      {/* Title Placeholder */}
+      <div className="h-4 bg-slate-800/60 rounded w-2/3 mb-3.5" />
+
+      {/* Description Placeholder */}
+      <div className="space-y-2 mb-4">
+        <div className="h-3 bg-slate-800/40 rounded w-full" />
+        <div className="h-3 bg-slate-800/40 rounded w-5/6" />
+      </div>
+
+      {/* Badges/Tags Placeholders */}
+      <div className="flex flex-wrap gap-1.5 mb-4">
+        <div className="w-16 h-5 bg-slate-800/50 rounded-md" />
+        <div className="w-24 h-5 bg-slate-800/50 rounded-md" />
+      </div>
+
+      {/* Bottom Action buttons Placeholder */}
+      <div className="flex justify-end pt-3 border-t border-slate-800/40">
+        <div className="w-24 h-6.5 bg-slate-800/30 rounded-lg" />
+      </div>
     </div>
   );
 }
